@@ -76,12 +76,25 @@ def clean_col_name(col: str) -> str:
     return cleaned.strip().upper()
 
 
-def clean_valor(val) -> float:
-    """Converte com segurança valores monetários (BR ou US) para float."""
+def fmt_brl(val) -> str:
+    """Formata valor estritamente positivo em moeda brasileira R$ 1.234.567,89."""
+    if pd.isna(val) or val is None:
+        return "R$ 0,00"
+    try:
+        v = abs(float(val))
+        formatted = f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        return f"R$ {formatted}"
+    except:
+        return "R$ 0,00"
+
+
+def clean_valor(val, force_abs: bool = True) -> float:
+    """Converte com segurança valores monetários (BR ou US) para float, forçando valor positivo por padrão."""
     if pd.isna(val) or val is None:
         return 0.0
     if isinstance(val, (int, float)):
-        return float(val) if not pd.isna(val) else 0.0
+        res = float(val) if not pd.isna(val) else 0.0
+        return abs(res) if force_abs else res
     s = str(val).strip()
     if not s or s in ["-", "--", "nan", "NAN", "null", "NULL", ""]:
         return 0.0
@@ -93,10 +106,12 @@ def clean_valor(val) -> float:
     elif "," in s and "." not in s:
         s = s.replace(",", ".")
     try:
-        return float(s)
+        res = float(s)
+        return abs(res) if force_abs else res
     except:
         m = re.search(r"[-+]?\d*\.?\d+", s)
-        return float(m.group()) if m else 0.0
+        res = float(m.group()) if m else 0.0
+        return abs(res) if force_abs else res
 
 
 MES_NOMES = {
@@ -706,7 +721,7 @@ def calculate_predictive_provisioning(df, mes_analise):
                 "Categoria Estimada": categoria,
                 "Média Mensal Histórica (R$)": media_valor,
                 "Status no Mês": "NÃO LOCALIZADO NO EXTRATO",
-                "Ação Recomendada": f"Provisionar R$ {media_valor:,.2f} no fluxo de caixa operacional."
+                "Ação Recomendada": f"Provisionar {fmt_brl(media_valor)} no fluxo de caixa operacional."
             })
 
     return pd.DataFrame(alertas)
@@ -765,6 +780,10 @@ busca_geral = st.sidebar.text_input("Busca Rápida (Histórico / Credor)", "").s
 
 # Aplicação dos Filtros
 df_filtrado = df_base.copy()
+# Garantir que todos os valores de despesa sejam estritamente positivos
+if 'VALOR (R$)' in df_filtrado.columns:
+    df_filtrado['VALOR (R$)'] = df_filtrado['VALOR (R$)'].apply(lambda v: clean_valor(v, force_abs=True))
+
 if filtro_mes != "TODOS":
     df_filtrado = df_filtrado[df_filtrado['MÊS'] == filtro_mes]
 if filtro_status != "TODOS":
@@ -779,26 +798,54 @@ if busca_geral:
     ]
 
 # --------------------------------------------------------------------------------------
-# CABEÇALHO PRINCIPAL
+# CABEÇALHO PRINCIPAL (ESTRUTURA IDENTICA AO PREVIEW)
 # --------------------------------------------------------------------------------------
-st.markdown('<div class="main-title">💼 Controladoria & Auditoria Financeira</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="sub-title">Saneamento de naturezas de gastos, otimização de liquidez de caixa e auditoria de extrato</div>',
-    unsafe_allow_html=True
-)
+status_badge_text = f"Arquivo: {uploaded_file.name}" if not is_demo and uploaded_file else "Demonstração (0. EXTRATO GERAL)"
+status_badge_style = "background:#ecfdf5; color:#065f46; border:1px solid #a7f3d0;" if not is_demo else "background:#fef3c7; color:#92400e; border:1px solid #fde68a;"
+
+st.markdown(f"""
+<div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; flex-wrap:wrap; gap:12px;">
+    <div style="display:flex; align-items:center; gap:12px;">
+        <div style="background:#022c22; color:#10b981; border-radius:10px; width:44px; height:44px; display:flex; align-items:center; justify-content:center; font-size:22px; box-shadow:0 1px 3px rgba(0,0,0,0.1);">🏛️</div>
+        <div>
+            <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                <span style="font-size:22px; font-weight:800; color:#0f172a;">Controladoria & Auditoria Financeira</span>
+                <span style="{status_badge_style} font-size:11px; padding:2px 8px; border-radius:9999px; font-weight:700;">{status_badge_text}</span>
+            </div>
+            <div style="font-size:13px; color:#64748b; margin-top:2px;">Saneamento de naturezas de despesas, otimização de fluxo de caixa e diagnóstico de governança</div>
+        </div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
 # Banner de Métricas Rápidas
 col_m1, col_m2, col_m3, col_m4 = st.columns(4)
 total_volume = df_filtrado['VALOR (R$)'].sum() if 'VALOR (R$)' in df_filtrado.columns else 0.0
 total_linhas = len(df_filtrado)
 abertos_volume = df_filtrado[df_filtrado['STATUS'] == 'EM ABERTO']['VALOR (R$)'].sum() if 'VALOR (R$)' in df_filtrado.columns else 0.0
+
+# Se a aba BANCOS tiver saldo, usa dela; caso contrário, extrai despesas bancárias reais do extrato filtrado
 passivo_bancos_total = df_bancos['Saldo Devedor (R$)'].sum() if not df_bancos.empty and 'Saldo Devedor (R$)' in df_bancos.columns else 0.0
+if passivo_bancos_total == 0:
+    bancos_kws = ["BANCO", "ITAU", "BRADESCO", "SANTANDER", "BRASIL", "SAFRA", "CAIXA", "SICOOB", "SICREDI", "INTER", "TARIFA", "IOF", "FINANC", "EMPRESTIMO"]
+    pat_bancos = "|".join(bancos_kws)
+    df_bancos_ext = df_filtrado[
+        df_filtrado['LANÇAMENTO'].astype(str).str.upper().str.contains(pat_bancos) |
+        df_filtrado['RAZÃO SOCIAL'].astype(str).str.upper().str.contains(pat_bancos) |
+        df_filtrado['GRUPO'].astype(str).str.upper().str.contains("FINANCEIRA|BANCO")
+    ]
+    passivo_bancos_total = df_bancos_ext['VALOR (R$)'].sum() if not df_bancos_ext.empty else 0.0
+    passivo_label = "Despesas Bancárias (Extrato)"
+    passivo_sub = f"{len(df_bancos_ext)} lançamentos bancários"
+else:
+    passivo_label = "Passivos Bancários (Saldo)"
+    passivo_sub = "Contratos na aba BANCOS"
 
 with col_m1:
     st.markdown(f"""
     <div class="metric-card">
         <div class="metric-title">Volume Analisado</div>
-        <div class="metric-value">R$ {total_volume:,.2f}</div>
+        <div class="metric-value">{fmt_brl(total_volume)}</div>
         <div style="font-size:11px; color:#64748b; margin-top:2px;">{total_linhas} lançamentos filtrados</div>
     </div>
     """, unsafe_allow_html=True)
@@ -807,7 +854,7 @@ with col_m2:
     st.markdown(f"""
     <div class="metric-card">
         <div class="metric-title">Despesas em Aberto</div>
-        <div class="metric-value" style="color:#d97706;">R$ {abertos_volume:,.2f}</div>
+        <div class="metric-value" style="color:#d97706;">{fmt_brl(abertos_volume)}</div>
         <div style="font-size:11px; color:#d97706; margin-top:2px;">Aguardando liquidação</div>
     </div>
     """, unsafe_allow_html=True)
@@ -815,19 +862,18 @@ with col_m2:
 with col_m3:
     st.markdown(f"""
     <div class="metric-card">
-        <div class="metric-title">Passivos Bancários (Saldo)</div>
-        <div class="metric-value" style="color:#dc2626;">R$ {passivo_bancos_total:,.2f}</div>
-        <div style="font-size:11px; color:#dc2626; margin-top:2px;">Contratos na aba BANCOS</div>
+        <div class="metric-title">{passivo_label}</div>
+        <div class="metric-value" style="color:#2563eb;">{fmt_brl(passivo_bancos_total)}</div>
+        <div style="font-size:11px; color:#64748b; margin-top:2px;">{passivo_sub}</div>
     </div>
     """, unsafe_allow_html=True)
 
 with col_m4:
-    status_base_txt = "Base Demonstração (0. EXTRATO GERAL)" if is_demo else (uploaded_file.name if uploaded_file else "Manual")
     st.markdown(f"""
     <div class="metric-card">
         <div class="metric-title">Status do Arquivo</div>
-        <div class="metric-value" style="font-size:15px; color:#059669;">{'✅ Carregado' if not is_demo else '📌 Demo'}</div>
-        <div style="font-size:11px; color:#64748b; margin-top:2px;">{status_base_txt[:28]}</div>
+        <div class="metric-value" style="font-size:16px; color:#059669;">{'✅ Carregado' if not is_demo else '📌 Demo'}</div>
+        <div style="font-size:11px; color:#64748b; margin-top:2px;">{uploaded_file.name if uploaded_file else '0. EXTRATO GERAL'}</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -867,7 +913,7 @@ with tab_caixa:
         col_dr1, col_dr2 = st.columns([1, 2])
 
         with col_dr1:
-            st.metric("Total de Drenos Financeiros", f"R$ {total_drenos:,.2f}", f"{len(df_drenos)} saídas")
+            st.metric("Total de Drenos Financeiros", fmt_brl(total_drenos), f"{len(df_drenos)} saídas")
             st.info("💡 Custos com tarifas de conta, IOF de crédito, juros de mora e encargos por atraso de títulos.")
 
         with col_dr2:
@@ -908,7 +954,7 @@ with tab_caixa:
                 y=media_diaria,
                 line_dash="dash",
                 line_color="red",
-                annotation_text=f"Média Diária: R$ {media_diaria:,.2f}"
+                annotation_text=f"Média Diária: {fmt_brl(media_diaria)}"
             )
             fig_daily.update_layout(
                 title="Desembolsos Diários (Barras Vermelhas: Picos > 150% da Média)",
@@ -922,17 +968,40 @@ with tab_caixa:
             st.info("Sem dados diários para exibição.")
 
     with subtab_passivos:
-        st.markdown("#### Contratos Bancários, Financiamentos e Consórcios (Aba BANCOS)")
-        if df_bancos.empty:
-            st.warning("Nenhum registro encontrado na aba BANCOS.")
+        st.markdown("#### Contratos Bancários, Financiamentos e Consórcios")
+        if df_bancos.empty or df_bancos['Saldo Devedor (R$)'].sum() == 0:
+            st.info("💡 A aba BANCOS não possui contratos estruturados nesta planilha. A Controladoria realizou uma varredura automática no próprio extrato para identificar movimentações com instituições financeiras.")
+            bancos_kws = ["BANCO", "ITAU", "BRADESCO", "SANTANDER", "BRASIL", "SAFRA", "CAIXA", "SICOOB", "SICREDI", "INTER", "TARIFA", "IOF", "FINANC", "EMPRESTIMO"]
+            pat_bancos = "|".join(bancos_kws)
+            df_bancos_ext = df_filtrado[
+                df_filtrado['LANÇAMENTO'].astype(str).str.upper().str.contains(pat_bancos) |
+                df_filtrado['RAZÃO SOCIAL'].astype(str).str.upper().str.contains(pat_bancos) |
+                df_filtrado['GRUPO'].astype(str).str.upper().str.contains("FINANCEIRA|BANCO")
+            ].copy()
+            
+            if not df_bancos_ext.empty:
+                col_eb1, col_eb2, col_eb3 = st.columns(3)
+                with col_eb1:
+                    st.metric("Total de Movimentações Bancárias", fmt_brl(df_bancos_ext['VALOR (R$)'].sum()))
+                with col_eb2:
+                    st.metric("Saídas Identificadas", f"{len(df_bancos_ext)} lançamentos")
+                with col_eb3:
+                    abertos_banco = df_bancos_ext[df_bancos_ext['STATUS'] == 'EM ABERTO']['VALOR (R$)'].sum()
+                    st.metric("Aguardando Liquidação", fmt_brl(abertos_banco))
+                
+                st.markdown("##### Detalhamento das Despesas Bancárias no Extrato:")
+                cols_b_show = [c for c in ['DATA', 'STATUS', 'MÊS', 'LANÇAMENTO', 'RAZÃO SOCIAL', 'VALOR (R$)', 'GRUPO'] if c in df_bancos_ext.columns]
+                st.dataframe(df_bancos_ext[cols_b_show], use_container_width=True)
+            else:
+                st.warning("Nenhum passivo bancário ou despesa financeira identificada no extrato.")
         else:
             col_b1, col_b2 = st.columns(2)
             with col_b1:
                 saldo_bancos = df_bancos['Saldo Devedor (R$)'].sum() if 'Saldo Devedor (R$)' in df_bancos.columns else 0.0
-                st.metric("Saldo Devedor Total", f"R$ {saldo_bancos:,.2f}")
+                st.metric("Saldo Devedor Total", fmt_brl(saldo_bancos))
             with col_b2:
                 parcela_bancos = df_bancos['Valor Parcela (R$)'].sum() if 'Valor Parcela (R$)' in df_bancos.columns else 0.0
-                st.metric("Compromisso Mensal (Parcelas)", f"R$ {parcela_bancos:,.2f}")
+                st.metric("Compromisso Mensal (Parcelas)", fmt_brl(parcela_bancos))
 
             st.dataframe(df_bancos, use_container_width=True)
 
@@ -1054,7 +1123,7 @@ with tab_auditoria:
         df_lixeira = df_filtrado[df_filtrado['GRUPO'].astype(str).str.upper().isin(grupos_lixeira)]
 
         total_lix = df_lixeira['VALOR (R$)'].sum() if not df_lixeira.empty else 0.0
-        st.metric("Total em Contas Genéricas", f"R$ {total_lix:,.2f}", f"{len(df_lixeira)} itens")
+        st.metric("Total em Contas Genéricas", fmt_brl(total_lix), f"{len(df_lixeira)} itens")
         if not df_lixeira.empty:
             cols_lix = [c for c in ['DATA', 'LANÇAMENTO', 'RAZÃO SOCIAL', 'VALOR (R$)', 'GRUPO'] if c in df_lixeira.columns]
             st.dataframe(df_lixeira[cols_lix], use_container_width=True)
@@ -1066,7 +1135,7 @@ with tab_auditoria:
             (df_filtrado['RAZÃO SOCIAL'].astype(str).str.upper().isin(["NAN", "NULL", "", "NÃO IDENTIFICADO"]))
         ]
         total_sem = df_sem_cad['VALOR (R$)'].sum() if not df_sem_cad.empty else 0.0
-        st.metric("Risco Fiscal (Sem Cadastro)", f"R$ {total_sem:,.2f}", f"{len(df_sem_cad)} itens")
+        st.metric("Risco Fiscal (Sem Cadastro)", fmt_brl(total_sem), f"{len(df_sem_cad)} itens")
         if not df_sem_cad.empty:
             cols_sem = [c for c in ['DATA', 'LANÇAMENTO', 'RAZÃO SOCIAL', 'CPF/CNPJ', 'VALOR (R$)'] if c in df_sem_cad.columns]
             st.dataframe(df_sem_cad[cols_sem], use_container_width=True)
@@ -1095,7 +1164,7 @@ with tab_provisao:
         st.success(f"✅ Todas as contas recorrentes históricas constam no mês {mes_corte}!")
     else:
         total_risco_provisao = df_provisao['Média Mensal Histórica (R$)'].sum()
-        st.error(f"⚠️ Risco de Caixa Oculto: R$ {total_risco_provisao:,.2f} em {len(df_provisao)} despesas recorrentes não faturadas em {mes_corte}.")
+        st.error(f"⚠️ Risco de Caixa Oculto: {fmt_brl(total_risco_provisao)} em {len(df_provisao)} despesas recorrentes não faturadas em {mes_corte}.")
         st.dataframe(df_provisao, use_container_width=True)
 
 
@@ -1134,12 +1203,12 @@ Você é um Auditor e Perito em Controladoria Financeira Sênior (CFO / Diretor 
 Analise os dados sumarizados da empresa referentes ao relatório '0. EXTRATO GERAL.xlsx' e elabore um PARECER EXECUTIVO DE CONTROLADORIA E AUDITORIA.
 
 MÉTRICAS DO RELATÓRIO:
-- Volume Total Analisado: R$ {total_volume:,.2f} ({total_linhas} lançamentos)
-- Despesas em Aberto: R$ {abertos_volume:,.2f}
-- Drenos Financeiros (Tarifas/Juros/IOF): R$ {drenos_val:,.2f}
-- Saldo Devedor Bancário: R$ {passivo_bancos_total:,.2f}
-- Contas Lixeira ('OUTROS'/'DIVERSOS'): R$ {lixeira_val:,.2f}
-- Despesas sem CNPJ/Razão Social: R$ {sem_cad_val:,.2f}
+- Volume Total Analisado: {fmt_brl(total_volume)} ({total_linhas} lançamentos)
+- Despesas em Aberto: {fmt_brl(abertos_volume)}
+- Drenos Financeiros (Tarifas/Juros/IOF): {fmt_brl(drenos_val)}
+- Saldo Devedor Bancário: {fmt_brl(passivo_bancos_total)}
+- Contas Lixeira ('OUTROS'/'DIVERSOS'): {fmt_brl(lixeira_val)}
+- Despesas sem CNPJ/Razão Social: {fmt_brl(sem_cad_val)}
 - Inconsistências de Natureza Contábil: {ajustes_len} lançamentos identificados
 
 INSTRUÇÃO COMPLEMENTAR DO AUDITOR:

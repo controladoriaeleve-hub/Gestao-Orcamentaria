@@ -14,8 +14,11 @@ function cleanString(val: any): string {
   return String(val).trim();
 }
 
-function parseNumber(val: any): number {
-  if (typeof val === "number") return isNaN(val) ? 0 : val;
+function parseNumber(val: any, forceAbs: boolean = true): number {
+  if (typeof val === "number") {
+    if (isNaN(val)) return 0;
+    return forceAbs ? Math.abs(val) : val;
+  }
   if (!val) return 0;
   const str = String(val).trim();
   if (["-", "--", "nan", "NAN", "null", "NULL", ""].includes(str)) return 0;
@@ -29,7 +32,8 @@ function parseNumber(val: any): number {
     cleanStr = cleanStr.replace(/,/g, ".");
   }
   const num = parseFloat(cleanStr);
-  return isNaN(num) ? 0 : num;
+  if (isNaN(num)) return 0;
+  return forceAbs ? Math.abs(num) : num;
 }
 
 const MES_MAP: Record<string, string> = {
