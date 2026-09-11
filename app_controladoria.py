@@ -67,7 +67,7 @@ st.markdown("""
 
 
 # --------------------------------------------------------------------------------------
-# UTILITÁRIOS DE NORMALIZAÇÃO DE DATAFRAMES (PREVENÇÃO DE KEYERROR)
+# UTILITÁRIOS DE NORMALIZAÇÃO DE DATAFRAMES & LEITURA INTELIGENTE
 # --------------------------------------------------------------------------------------
 def clean_col_name(col: str) -> str:
     """Remove acentos, espaços extras e converte para maiúsculo."""
@@ -76,61 +76,167 @@ def clean_col_name(col: str) -> str:
     return cleaned.strip().upper()
 
 
+def clean_valor(val) -> float:
+    """Converte com segurança valores monetários (BR ou US) para float."""
+    if pd.isna(val) or val is None:
+        return 0.0
+    if isinstance(val, (int, float)):
+        return float(val) if not pd.isna(val) else 0.0
+    s = str(val).strip()
+    if not s or s in ["-", "--", "nan", "NAN", "null", "NULL", ""]:
+        return 0.0
+    # Remove símbolos de moeda e espaços
+    s = re.sub(r"[R$\s]", "", s)
+    # Formato brasileiro com milhar em ponto e decimal em vírgula: "5.214,09" -> "5214.09"
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s and "." not in s:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except:
+        m = re.search(r"[-+]?\d*\.?\d+", s)
+        return float(m.group()) if m else 0.0
+
+
+MES_NOMES = {
+    1: "01 - JAN", 2: "02 - FEV", 3: "03 - MAR", 4: "04 - ABR",
+    5: "05 - MAI", 6: "06 - JUN", 7: "07 - JUL", 8: "08 - AGO",
+    9: "09 - SET", 10: "10 - OUT", 11: "11 - NOV", 12: "12 - DEZ",
+    "1": "01 - JAN", "2": "02 - FEV", "3": "03 - MAR", "4": "04 - ABR",
+    "5": "05 - MAI", "6": "06 - JUN", "7": "07 - JUL", "8": "08 - AGO",
+    "9": "09 - SET", "10": "10 - OUT", "11": "11 - NOV", "12": "12 - DEZ",
+    "01": "01 - JAN", "02": "02 - FEV", "03": "03 - MAR", "04": "04 - ABR",
+    "05": "05 - MAI", "06": "06 - JUN", "07": "07 - JUL", "08": "08 - AGO",
+    "09": "09 - SET",
+}
+
+
+def format_mes_val(val, data_val=None) -> str:
+    """Formata mês numérico ou textual para exibição consistente."""
+    if pd.isna(val) or val is None:
+        s = ""
+    else:
+        s = str(val).strip()
+
+    if re.match(r"^\d+\.0$", s):
+        s = s.split(".")[0]
+
+    if s in MES_NOMES:
+        if data_val and not pd.isna(data_val):
+            try:
+                dt = pd.to_datetime(data_val, errors='coerce')
+                if pd.notna(dt):
+                    return f"{MES_NOMES[s].split(' - ')[1]}/{dt.year}"
+            except:
+                pass
+        return MES_NOMES[s]
+
+    if not s or s.upper() in ["NAN", "NONE", "NULL"]:
+        if data_val and not pd.isna(data_val):
+            try:
+                dt = pd.to_datetime(data_val, errors='coerce')
+                if pd.notna(dt):
+                    return dt.strftime('%b/%Y').upper()
+            except:
+                pass
+        return "GERAL"
+
+    return s.upper()
+
+
+def find_sheet_header_and_read(excel_file, sheet_name: str) -> pd.DataFrame:
+    """
+    Localiza dinamicamente a linha de cabeçalho do Excel e retorna o DataFrame
+    limpo, mesmo se a linha 1 for vazia ou contiver banners/cabeçalhos deslocados.
+    """
+    try:
+        df_raw = pd.read_excel(excel_file, sheet_name=sheet_name, header=None)
+        if df_raw.empty:
+            return pd.DataFrame()
+
+        keywords = [
+            "STATUS", "MES", "DATA", "LANCAMENTO", "HISTORICO",
+            "RAZAO SOCIAL", "RAZAO", "FORNECEDOR", "CREDOR",
+            "CPF", "CNPJ", "VALOR", "GRUPO", "NATUREZA", "TIPO",
+            "BANCO", "SALDO", "PARCELA", "CATEGORIA", "DESCRICAO", "META"
+        ]
+
+        header_idx = 0
+        best_score = 0
+
+        # Analisa até as 20 primeiras linhas para encontrar a linha do cabeçalho
+        for r_idx in range(min(20, len(df_raw))):
+            row_vals = df_raw.iloc[r_idx].dropna().tolist()
+            score = 0
+            for val in row_vals:
+                norm = clean_col_name(str(val))
+                for kw in keywords:
+                    if kw in norm:
+                        score += 1
+                        break
+            if score > best_score:
+                best_score = score
+                header_idx = r_idx
+
+        if best_score >= 2:
+            df = pd.read_excel(excel_file, sheet_name=sheet_name, header=header_idx)
+        else:
+            df = pd.read_excel(excel_file, sheet_name=sheet_name)
+
+        # Remove colunas e linhas totalmente vazias (ex: Coluna A em branco no Excel)
+        df = df.dropna(how="all", axis=1)
+        df = df.dropna(how="all", axis=0)
+
+        # Limpar espaços nos nomes das colunas
+        df.columns = [str(c).strip() for c in df.columns]
+
+        return df
+    except Exception:
+        try:
+            return pd.read_excel(excel_file, sheet_name=sheet_name)
+        except:
+            return pd.DataFrame()
+
+
 def normalize_base_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Garante mapeamento robusto de colunas e colunas obrigatórias."""
+    """Garante mapeamento robusto de colunas e dados numéricos/textuais da BASE."""
     if df is None or df.empty:
         df = pd.DataFrame()
 
     col_mapping = {}
     for col in df.columns:
         norm = clean_col_name(col)
-        if norm in ["MES", "COMPETENCIA", "PERIODO", "MES ANO", "MES/ANO"]:
+        if norm in ["MES", "COMPETENCIA", "PERIODO", "MES ANO", "MES/ANO"] or "MES" in norm:
             col_mapping[col] = "MÊS"
-        elif norm in ["STATUS", "SITUACAO", "ESTADO"]:
+        elif norm in ["STATUS", "SITUACAO", "ESTADO"] or "STATUS" in norm or "SITUACAO" in norm:
             col_mapping[col] = "STATUS"
-        elif norm in ["DATA", "VENCIMENTO", "PAGAMENTO", "DATA PAGAMENTO", "DT PAGTO"]:
+        elif norm in ["DATA", "VENCIMENTO", "PAGAMENTO", "DATA PAGAMENTO", "DT PAGTO"] or "DATA" in norm or "VENCIMENTO" in norm:
             col_mapping[col] = "DATA"
-        elif norm in ["LANCAMENTO", "HISTORICO", "DESCRICAO", "DESCRICAO LANCAMENTO"]:
+        elif norm in ["LANCAMENTO", "HISTORICO", "DESCRICAO", "DESCRICAO LANCAMENTO"] or "LANCAMENTO" in norm or "HISTORICO" in norm:
             col_mapping[col] = "LANÇAMENTO"
-        elif norm in ["RAZAO SOCIAL", "FORNECEDOR", "CREDOR", "BENEFICIARIO", "CLIENTE", "FAVORECIDO"]:
+        elif norm in ["RAZAO SOCIAL", "FORNECEDOR", "CREDOR", "BENEFICIARIO", "CLIENTE", "FAVORECIDO"] or "RAZAO" in norm or "FORNECEDOR" in norm or "CREDOR" in norm:
             col_mapping[col] = "RAZÃO SOCIAL"
-        elif norm in ["CPF/CNPJ", "CNPJ", "CPF", "DOC", "DOCUMENTO"]:
+        elif norm in ["CPF/CNPJ", "CNPJ", "CPF", "DOC", "DOCUMENTO"] or "CNPJ" in norm or "CPF" in norm:
             col_mapping[col] = "CPF/CNPJ"
-        elif norm in ["VALOR (R$)", "VALOR", "VALOR R$", "VALOR LIQUIDO", "TOTAL", "VALOR PAGO"]:
+        elif "VALOR" in norm or "TOTAL" in norm or "LIQUIDO" in norm:
             col_mapping[col] = "VALOR (R$)"
-        elif norm in ["GRUPO", "CENTRO DE CUSTO", "CATEGORIA", "CLASSIFICACAO", "GRUPO DESPESA"]:
-            col_mapping[col] = "GRUPO"
-        elif norm in ["COD GRUPO", "COD. GRUPO", "CODIGO GRUPO"]:
+        elif "COD" in norm and "GRUPO" in norm:
             col_mapping[col] = "CÓD GRUPO"
-        elif norm in ["COD NATUREZA", "COD. NATUREZA", "CODIGO NATUREZA"]:
+        elif "COD" in norm and "NATUREZA" in norm:
             col_mapping[col] = "CÓD. NATUREZA"
-        elif norm in ["DESCRICAO NATUREZA", "NATUREZA", "CONTA CONTABIL"]:
+        elif "DESC" in norm and "NATUREZA" in norm:
             col_mapping[col] = "DESCRIÇÃO NATUREZA"
-        elif norm in ["TIPO", "TIPO DESPESA", "TIPO CUSTO"]:
+        elif "NATUREZA" in norm:
+            col_mapping[col] = "DESCRIÇÃO NATUREZA"
+        elif "GRUPO" in norm:
+            col_mapping[col] = "GRUPO"
+        elif "TIPO" in norm:
             col_mapping[col] = "TIPO"
 
     df = df.rename(columns=col_mapping)
 
-    # 1. MÊS
-    if "MÊS" not in df.columns:
-        if "DATA" in df.columns:
-            try:
-                df["MÊS"] = pd.to_datetime(df["DATA"], errors='coerce').dt.strftime('%b/%Y').str.upper()
-                df["MÊS"] = df["MÊS"].fillna("GERAL")
-            except:
-                df["MÊS"] = "GERAL"
-        else:
-            df["MÊS"] = "GERAL"
-    else:
-        df["MÊS"] = df["MÊS"].fillna("GERAL").astype(str).str.strip().str.upper()
-
-    # 2. STATUS
-    if "STATUS" not in df.columns:
-        df["STATUS"] = "PAGO"
-    else:
-        df["STATUS"] = df["STATUS"].fillna("PAGO").astype(str).str.strip().str.upper()
-
-    # 3. VALOR (R$)
+    # 1. VALOR (R$)
     if "VALOR (R$)" not in df.columns:
         for c in df.columns:
             if "VALOR" in clean_col_name(c):
@@ -139,41 +245,59 @@ def normalize_base_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         else:
             df["VALOR (R$)"] = 0.0
 
-    if "VALOR (R$)" in df.columns:
-        if df["VALOR (R$)"].dtype == object:
-            df["VALOR (R$)"] = (
-                df["VALOR (R$)"]
-                .astype(str)
-                .str.replace("R$", "", regex=False)
-                .str.replace(".", "", regex=False)
-                .str.replace(",", ".", regex=False)
-                .str.strip()
-            )
-        df["VALOR (R$)"] = pd.to_numeric(df["VALOR (R$)"], errors="coerce").fillna(0.0)
+    df["VALOR (R$)"] = df["VALOR (R$)"].apply(clean_valor)
 
-    # 4. GRUPO
+    # 2. STATUS
+    if "STATUS" not in df.columns:
+        df["STATUS"] = "PAGO"
+    else:
+        def clean_status_val(v):
+            s = str(v).strip().upper()
+            if "ABERTO" in s:
+                return "EM ABERTO"
+            if "PAGO" in s or "LIQUIDADO" in s or "BAIXADO" in s:
+                return "PAGO"
+            if "CANCEL" in s:
+                return "CANCELADO"
+            return s if s and s != "NAN" else "PAGO"
+        df["STATUS"] = df["STATUS"].apply(clean_status_val)
+
+    # 3. DATA
+    if "DATA" not in df.columns:
+        df["DATA"] = "2026-01-01"
+    else:
+        df["DATA"] = df["DATA"].astype(str).str.strip()
+
+    # 4. MÊS
+    if "MÊS" not in df.columns:
+        if "DATA" in df.columns:
+            df["MÊS"] = df["DATA"].apply(lambda d: format_mes_val(None, d))
+        else:
+            df["MÊS"] = "GERAL"
+    else:
+        df["MÊS"] = [
+            format_mes_val(m, d)
+            for m, d in zip(df["MÊS"], df.get("DATA", [None] * len(df)))
+        ]
+
+    # 5. GRUPO
     if "GRUPO" not in df.columns:
         df["GRUPO"] = "OUTROS"
     else:
         df["GRUPO"] = df["GRUPO"].fillna("OUTROS").astype(str).str.strip().str.upper()
 
-    # 5. RAZÃO SOCIAL
+    # 6. RAZÃO SOCIAL
     if "RAZÃO SOCIAL" not in df.columns:
         df["RAZÃO SOCIAL"] = "NÃO IDENTIFICADO"
     else:
         df["RAZÃO SOCIAL"] = df["RAZÃO SOCIAL"].fillna("NÃO IDENTIFICADO").astype(str).str.strip()
+        df["RAZÃO SOCIAL"] = df["RAZÃO SOCIAL"].replace({"": "NÃO IDENTIFICADO", "nan": "NÃO IDENTIFICADO", "NAN": "NÃO IDENTIFICADO", "-": "NÃO IDENTIFICADO"})
 
-    # 6. LANÇAMENTO
+    # 7. LANÇAMENTO
     if "LANÇAMENTO" not in df.columns:
         df["LANÇAMENTO"] = "Sem histórico"
     else:
         df["LANÇAMENTO"] = df["LANÇAMENTO"].fillna("Sem histórico").astype(str).str.strip()
-
-    # 7. DATA
-    if "DATA" not in df.columns:
-        df["DATA"] = "2026-01-01"
-    else:
-        df["DATA"] = df["DATA"].astype(str).str.strip()
 
     # 8. CPF/CNPJ
     if "CPF/CNPJ" not in df.columns:
@@ -206,24 +330,27 @@ def normalize_board_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         norm = clean_col_name(col)
         if "CATEGORIA" in norm or "GRUPO" in norm:
             col_map[col] = "Categoria"
-        elif "DESCRICAO" in norm or "DETALHE" in norm:
+        elif "DESCRICAO" in norm or "DETALHE" in norm or "ITEM" in norm:
             col_map[col] = "Descrição"
-        elif "META" in norm or "ORCADO" in norm:
+        elif "META" in norm or "ORCADO" in norm or "PREVISTO" in norm:
             col_map[col] = "Meta Mensal (R$)"
-        elif "REALIZADO" in norm or "MEDIO" in norm or "ATUAL" in norm:
+        elif "REALIZADO" in norm or "MEDIO" in norm or "ATUAL" in norm or "GASTO" in norm:
             col_map[col] = "Realizado Médio (R$)"
-        elif "OBSERVACAO" in norm or "NOTAS" in norm:
+        elif "OBSERVACAO" in norm or "NOTA" in norm:
             col_map[col] = "Observação"
 
     df = df.rename(columns=col_map)
     for col in ["Categoria", "Descrição", "Observação"]:
         if col not in df.columns:
             df[col] = ""
+        else:
+            df[col] = df[col].fillna("").astype(str).str.strip()
+
     for col in ["Meta Mensal (R$)", "Realizado Médio (R$)"]:
         if col not in df.columns:
             df[col] = 0.0
         else:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+            df[col] = df[col].apply(clean_valor)
 
     return df
 
@@ -239,34 +366,38 @@ def normalize_bancos_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     col_map = {}
     for col in df.columns:
         norm = clean_col_name(col)
-        if "BANCO" in norm or "INSTITUICAO" in norm:
+        if "BANCO" in norm or "INSTITUICAO" in norm or "CREDOR" in norm:
             col_map[col] = "Banco"
-        elif "OPERACAO" in norm or "TIPO" in norm:
+        elif "OPERACAO" in norm or "MODALIDADE" in norm:
             col_map[col] = "Tipo de Operação"
-        elif "CONTRATO" in norm:
+        elif "CONTRATO" in norm or "NUMERO" in norm:
             col_map[col] = "Contrato"
         elif "SALDO" in norm or "DEVEDOR" in norm:
             col_map[col] = "Saldo Devedor (R$)"
-        elif "PARCELA" in norm and ("VALOR" in norm or "R$" in norm):
+        elif "PARCELA" in norm and ("VALOR" in norm or "R$" in norm or "MENSAL" in norm):
             col_map[col] = "Valor Parcela (R$)"
-        elif "RESTANTE" in norm or "QTD" in norm:
+        elif "RESTANTE" in norm or "QTD" in norm or "PRAZO" in norm:
             col_map[col] = "Parcelas Restantes"
         elif "VENCIMENTO" in norm or "DIA" in norm:
             col_map[col] = "Dia Vencimento"
         elif "TAXA" in norm or "JUROS" in norm:
             col_map[col] = "Taxa de Juros"
-        elif "STATUS" in norm:
+        elif "STATUS" in norm or "SITUACAO" in norm:
             col_map[col] = "Status"
 
     df = df.rename(columns=col_map)
     for col in ["Banco", "Tipo de Operação", "Contrato", "Taxa de Juros", "Status"]:
         if col not in df.columns:
             df[col] = ""
+        else:
+            df[col] = df[col].fillna("").astype(str).str.strip()
+
     for col in ["Saldo Devedor (R$)", "Valor Parcela (R$)"]:
         if col not in df.columns:
             df[col] = 0.0
         else:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+            df[col] = df[col].apply(clean_valor)
+
     for col in ["Parcelas Restantes", "Dia Vencimento"]:
         if col not in df.columns:
             df[col] = 0
@@ -353,31 +484,36 @@ def load_excel_file(uploaded_file):
         base_sheet = None
         for s in excel_file.sheet_names:
             s_clean = clean_col_name(s)
-            if "BASE" in s_clean or "EXTRATO" in s_clean:
+            if "BASE" in s_clean or "EXTRATO" in s_clean or "LANCAMENTO" in s_clean or "GERAL" in s_clean:
                 base_sheet = s
                 break
         if not base_sheet:
             base_sheet = excel_file.sheet_names[0]
-        df_base = pd.read_excel(excel_file, sheet_name=base_sheet)
-        df_base = normalize_base_dataframe(df_base)
+        
+        df_base_raw = find_sheet_header_and_read(excel_file, base_sheet)
+        df_base = normalize_base_dataframe(df_base_raw)
 
         # 2. DESPESA FIXA BOARD
         df_board = pd.DataFrame()
         for s in excel_file.sheet_names:
             s_clean = clean_col_name(s)
-            if "BOARD" in s_clean or "FIXA" in s_clean:
-                df_board = pd.read_excel(excel_file, sheet_name=s)
+            if "BOARD" in s_clean or ("FIXA" in s_clean and "DESPESA" in s_clean) or "ORCADO" in s_clean:
+                df_board_raw = find_sheet_header_and_read(excel_file, s)
+                df_board = normalize_board_dataframe(df_board_raw)
                 break
-        df_board = normalize_board_dataframe(df_board)
+        if df_board.empty:
+            df_board = normalize_board_dataframe(df_board)
 
         # 3. BANCOS
         df_bancos = pd.DataFrame()
         for s in excel_file.sheet_names:
             s_clean = clean_col_name(s)
-            if "BANCO" in s_clean or "PASSIVO" in s_clean:
-                df_bancos = pd.read_excel(excel_file, sheet_name=s)
+            if "BANCO" in s_clean or "PASSIVO" in s_clean or "DIVIDA" in s_clean or "EMPRESTIMO" in s_clean:
+                df_bancos_raw = find_sheet_header_and_read(excel_file, s)
+                df_bancos = normalize_bancos_dataframe(df_bancos_raw)
                 break
-        df_bancos = normalize_bancos_dataframe(df_bancos)
+        if df_bancos.empty:
+            df_bancos = normalize_bancos_dataframe(df_bancos)
 
         return df_base, df_board, df_bancos, True, None
     except Exception as e:

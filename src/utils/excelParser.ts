@@ -18,13 +18,49 @@ function parseNumber(val: any): number {
   if (typeof val === "number") return isNaN(val) ? 0 : val;
   if (!val) return 0;
   const str = String(val).trim();
-  // Remove currency symbols, fix Brazilian vs US decimal formats
-  const cleanStr = str
-    .replace(/[R$\s]/g, "")
-    .replace(/\./g, "")
-    .replace(/,/g, ".");
+  if (["-", "--", "nan", "NAN", "null", "NULL", ""].includes(str)) return 0;
+
+  // Remove currency symbols and spaces
+  let cleanStr = str.replace(/[R$\s]/g, "");
+  // Brazilian format: 5.214,09 -> 5214.09
+  if (cleanStr.includes(",") && cleanStr.includes(".")) {
+    cleanStr = cleanStr.replace(/\./g, "").replace(/,/g, ".");
+  } else if (cleanStr.includes(",") && !cleanStr.includes(".")) {
+    cleanStr = cleanStr.replace(/,/g, ".");
+  }
   const num = parseFloat(cleanStr);
   return isNaN(num) ? 0 : num;
+}
+
+const MES_MAP: Record<string, string> = {
+  "1": "01 - JAN", "2": "02 - FEV", "3": "03 - MAR", "4": "04 - ABR",
+  "5": "05 - MAI", "6": "06 - JUN", "7": "07 - JUL", "8": "08 - AGO",
+  "9": "09 - SET", "10": "10 - OUT", "11": "11 - NOV", "12": "12 - DEZ",
+  "01": "01 - JAN", "02": "02 - FEV", "03": "03 - MAR", "04": "04 - ABR",
+  "05": "05 - MAI", "06": "06 - JUN", "07": "07 - JUL", "08": "08 - AGO",
+  "09": "09 - SET"
+};
+
+function formatMes(val: any, dataStr?: string): string {
+  if (val === null || val === undefined) val = "";
+  let s = String(val).trim();
+  if (s.endsWith(".0")) s = s.split(".")[0];
+  if (MES_MAP[s]) {
+    if (dataStr && !isNaN(Date.parse(dataStr))) {
+      const year = new Date(dataStr).getFullYear();
+      return `${MES_MAP[s].split(" - ")[1]}/${year}`;
+    }
+    return MES_MAP[s];
+  }
+  if (!s || s.toUpperCase() === "NAN" || s.toUpperCase() === "NULL") {
+    if (dataStr && !isNaN(Date.parse(dataStr))) {
+      const d = new Date(dataStr);
+      const mNames = ["JAN", "FEV", "MAR", "ABR", "MAI", "JUN", "JUL", "AGO", "SET", "OUT", "NOV", "DEZ"];
+      return `${mNames[d.getMonth()]}/${d.getFullYear()}`;
+    }
+    return "GERAL";
+  }
+  return s.toUpperCase();
 }
 
 function formatDate(val: any): string {
@@ -46,6 +82,69 @@ function formatDate(val: any): string {
   return str;
 }
 
+/**
+ * Lê uma aba do Excel procurando inteligentemente a linha de cabeçalho
+ * mesmo que as primeiras linhas sejam vazias ou títulos mesclados.
+ */
+function sheetToSmartJson(sheet: XLSX.WorkSheet): any[] {
+  if (!sheet) return [];
+  const rawData: any[][] = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
+  if (!rawData || rawData.length === 0) return [];
+
+  const keywords = [
+    "STATUS", "MES", "DATA", "LANCAMENTO", "HISTORICO", "RAZAO",
+    "FORNECEDOR", "CREDOR", "CPF", "CNPJ", "VALOR", "GRUPO", "NATUREZA",
+    "TIPO", "BANCO", "SALDO", "PARCELA", "CATEGORIA", "DESCRICAO", "META"
+  ];
+
+  let headerRowIndex = 0;
+  let maxScore = 0;
+
+  for (let r = 0; r < Math.min(25, rawData.length); r++) {
+    const row = rawData[r];
+    if (!Array.isArray(row)) continue;
+    let score = 0;
+    for (const cell of row) {
+      if (cell !== undefined && cell !== null) {
+        const cellStr = String(cell)
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .toUpperCase()
+          .trim();
+        for (const kw of keywords) {
+          if (cellStr.includes(kw)) {
+            score++;
+            break;
+          }
+        }
+      }
+    }
+    if (score > maxScore) {
+      maxScore = score;
+      headerRowIndex = r;
+    }
+  }
+
+  if (maxScore >= 2) {
+    const headers = (rawData[headerRowIndex] || []).map((h: any) => String(h || "").trim());
+    const dataRows: any[] = [];
+    for (let i = headerRowIndex + 1; i < rawData.length; i++) {
+      const row = rawData[i];
+      if (!Array.isArray(row) || row.every((c) => c === "" || c === null || c === undefined)) continue;
+      const obj: Record<string, any> = {};
+      headers.forEach((h: string, colIdx: number) => {
+        if (h) {
+          obj[h] = row[colIdx] !== undefined ? row[colIdx] : "";
+        }
+      });
+      dataRows.push(obj);
+    }
+    return dataRows;
+  }
+
+  return XLSX.utils.sheet_to_json(sheet, { defval: "" });
+}
+
 export async function parseExcelFile(file: File): Promise<ParsedExcelResult> {
   const arrayBuffer = await file.arrayBuffer();
   const workbook = XLSX.read(arrayBuffer, { type: "array", cellDates: true });
@@ -55,19 +154,32 @@ export async function parseExcelFile(file: File): Promise<ParsedExcelResult> {
   // 1. Locate BASE Sheet
   const baseSheetName =
     sheetNames.find((s) => s.toUpperCase() === "BASE") ||
-    sheetNames.find((s) => s.toUpperCase().includes("EXTRATO") || s.toUpperCase().includes("LANC")) ||
+    sheetNames.find((s) => s.toUpperCase().includes("EXTRATO") || s.toUpperCase().includes("LANC") || s.toUpperCase().includes("GERAL")) ||
     sheetNames[0];
 
   const baseRawRows: any[] = baseSheetName
-    ? XLSX.utils.sheet_to_json(workbook.Sheets[baseSheetName], { defval: "" })
+    ? sheetToSmartJson(workbook.Sheets[baseSheetName])
     : [];
 
   const base: BaseRecord[] = baseRawRows.map((row, idx) => {
     // Flexible header mapping
     const getField = (keys: string[]) => {
       for (const k of Object.keys(row)) {
-        const cleanK = k.trim().toUpperCase();
-        if (keys.some((target) => cleanK === target.toUpperCase() || cleanK.includes(target.toUpperCase()))) {
+        const cleanK = k
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .trim()
+          .toUpperCase();
+        if (
+          keys.some((target) => {
+            const cleanTarget = target
+              .normalize("NFD")
+              .replace(/[\u0300-\u036f]/g, "")
+              .trim()
+              .toUpperCase();
+            return cleanK === cleanTarget || cleanK.includes(cleanTarget);
+          })
+        ) {
           return row[k];
         }
       }
@@ -75,10 +187,13 @@ export async function parseExcelFile(file: File): Promise<ParsedExcelResult> {
     };
 
     const statusVal = cleanString(getField(["STATUS"])) || "PAGO";
-    const mesVal = cleanString(getField(["MÊS", "MES"])) || "GERAL";
     const dataVal = formatDate(getField(["DATA", "VENCIMENTO", "PAGAMENTO"]));
+    const mesVal = formatMes(getField(["MÊS", "MES"]), dataVal);
     const lancamentoVal = cleanString(getField(["LANÇAMENTO", "LANCAMENTO", "HISTÓRICO", "DESCRICAO", "DESCRIÇÃO"]));
-    const razaoVal = cleanString(getField(["RAZÃO SOCIAL", "RAZAO SOCIAL", "FORNECEDOR", "CREDOR", "BENEFICIÁRIO"]));
+    let razaoVal = cleanString(getField(["RAZÃO SOCIAL", "RAZAO SOCIAL", "FORNECEDOR", "CREDOR", "BENEFICIÁRIO"]));
+    if (!razaoVal || razaoVal === "-" || razaoVal.toUpperCase() === "NAN") {
+      razaoVal = "NÃO IDENTIFICADO";
+    }
     const cpfCnpjVal = cleanString(getField(["CPF/CNPJ", "CNPJ", "CPF", "DOCUMENTO"]));
     const valorVal = parseNumber(getField(["VALOR (R$)", "VALOR", "VALOR R$", "VALOR LIQUIDO", "TOTAL"]));
     const codGrupoVal = cleanString(getField(["CÓD GRUPO", "COD GRUPO", "COD. GRUPO", "CODIGO GRUPO"]));
@@ -93,8 +208,8 @@ export async function parseExcelFile(file: File): Promise<ParsedExcelResult> {
       mes: mesVal.toUpperCase(),
       data: dataVal,
       dataRaw: getField(["DATA"]),
-      lancamento: lancamentoVal.toUpperCase(),
-      razaoSocial: razaoVal ? razaoVal.toUpperCase() : "NAN",
+      lancamento: lancamentoVal.toUpperCase() || "SEM HISTÓRICO",
+      razaoSocial: razaoVal ? razaoVal.toUpperCase() : "NÃO IDENTIFICADO",
       cpfCnpj: cpfCnpjVal,
       valor: valorVal,
       codGrupo: codGrupoVal,
@@ -115,14 +230,25 @@ export async function parseExcelFile(file: File): Promise<ParsedExcelResult> {
 
   let despesasFixas: BoardFixedExpense[] = [];
   if (boardSheetName) {
-    const boardRawRows: any[] = XLSX.utils.sheet_to_json(workbook.Sheets[boardSheetName], { defval: "" });
-    despesasFixas = boardRawRows.map((row) => ({
-      categoria: cleanString(row["Categoria"] || row["CATEGORIA"] || row["Grupo"] || Object.values(row)[0]),
-      descricao: cleanString(row["Descrição"] || row["Descricao"] || row["DESCRICAO"] || row["Item"] || ""),
-      metaMensal: parseNumber(row["Meta Mensal (R$)"] || row["Meta"] || row["Orçado"] || row["META"] || row["Valor"]),
-      realizadoMedio: parseNumber(row["Realizado"] || row["Realizado Médio"] || 0),
-      observacao: cleanString(row["Observação"] || row["Observacao"] || row["Status"] || ""),
-    }));
+    const boardRawRows: any[] = sheetToSmartJson(workbook.Sheets[boardSheetName]);
+    despesasFixas = boardRawRows.map((row) => {
+      const getBoardField = (keys: string[]) => {
+        for (const k of Object.keys(row)) {
+          const cleanK = k.normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim().toUpperCase();
+          if (keys.some((target) => cleanK.includes(target.toUpperCase()))) {
+            return row[k];
+          }
+        }
+        return "";
+      };
+      return {
+        categoria: cleanString(getBoardField(["CATEGORIA", "GRUPO"]) || Object.values(row)[0] || "GERAL"),
+        descricao: cleanString(getBoardField(["DESCRICAO", "ITEM", "DETALHE"])),
+        metaMensal: parseNumber(getBoardField(["META", "ORCADO", "PREVISTO", "VALOR"])),
+        realizadoMedio: parseNumber(getBoardField(["REALIZADO", "MEDIO", "ATUAL", "GASTO"])),
+        observacao: cleanString(getBoardField(["OBSERVACAO", "NOTA", "STATUS"])),
+      };
+    });
   }
 
   // 3. Locate BANCOS Sheet
@@ -130,24 +256,36 @@ export async function parseExcelFile(file: File): Promise<ParsedExcelResult> {
     (s) =>
       s.toUpperCase().includes("BANCO") ||
       s.toUpperCase().includes("PASSIVO") ||
-      s.toUpperCase().includes("EMPRESTIMO")
+      s.toUpperCase().includes("EMPRESTIMO") ||
+      s.toUpperCase().includes("DIVIDA")
   );
 
   let bancos: BankLiability[] = [];
   if (bancosSheetName) {
-    const bancosRawRows: any[] = XLSX.utils.sheet_to_json(workbook.Sheets[bancosSheetName], { defval: "" });
-    bancos = bancosRawRows.map((row, idx) => ({
-      id: idx + 1,
-      banco: cleanString(row["Banco"] || row["Instituição"] || row["BANCO"] || "Banco"),
-      tipoOperacao: cleanString(row["Tipo de Operação"] || row["Tipo"] || row["Modalidade"] || "EMPRÉSTIMO"),
-      contrato: cleanString(row["Contrato"] || row["Nº Contrato"] || `CTR-${idx + 1}`),
-      saldoDevedor: parseNumber(row["Saldo Devedor (R$)"] || row["Saldo Devedor"] || row["Saldo"]),
-      valorParcela: parseNumber(row["Valor Parcela (R$)"] || row["Parcela"] || row["Valor Parcela"]),
-      parcelasRestantes: parseInt(cleanString(row["Parcelas Restantes"] || row["Qtd Parcelas"] || "12"), 10) || 0,
-      vencimentoDia: parseInt(cleanString(row["Dia Vencimento"] || row["Vencimento"] || "20"), 10) || 10,
-      taxaJuros: cleanString(row["Taxa de Juros"] || row["Taxa"] || "CDI + spread"),
-      status: cleanString(row["Status"] || "EM ABERTO").toUpperCase().includes("PAGO") ? "PAGO" : "EM ABERTO",
-    }));
+    const bancosRawRows: any[] = sheetToSmartJson(workbook.Sheets[bancosSheetName]);
+    bancos = bancosRawRows.map((row, idx) => {
+      const getBancosField = (keys: string[]) => {
+        for (const k of Object.keys(row)) {
+          const cleanK = k.normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim().toUpperCase();
+          if (keys.some((target) => cleanK.includes(target.toUpperCase()))) {
+            return row[k];
+          }
+        }
+        return "";
+      };
+      return {
+        id: idx + 1,
+        banco: cleanString(getBancosField(["BANCO", "INSTITUICAO", "CREDOR"]) || "Banco"),
+        tipoOperacao: cleanString(getBancosField(["OPERACAO", "MODALIDADE", "TIPO"]) || "EMPRÉSTIMO"),
+        contrato: cleanString(getBancosField(["CONTRATO", "NUMERO"]) || `CTR-${idx + 1}`),
+        saldoDevedor: parseNumber(getBancosField(["SALDO", "DEVEDOR"])),
+        valorParcela: parseNumber(getBancosField(["PARCELA", "MENSAL"])),
+        parcelasRestantes: parseInt(cleanString(getBancosField(["RESTANTE", "QTD", "PRAZO"]) || "12"), 10) || 0,
+        vencimentoDia: parseInt(cleanString(getBancosField(["VENCIMENTO", "DIA"]) || "20"), 10) || 10,
+        taxaJuros: cleanString(getBancosField(["TAXA", "JUROS"]) || "CDI + spread"),
+        status: cleanString(getBancosField(["STATUS", "SITUACAO"]) || "EM ABERTO").toUpperCase().includes("PAGO") ? "PAGO" : "EM ABERTO",
+      };
+    });
   }
 
   return {
