@@ -145,6 +145,21 @@ def format_mes_val(val, data_val=None) -> str:
     return s.upper()
 
 
+def safe_series(df: pd.DataFrame, col_name: str, default_val=None) -> pd.Series:
+    """
+    Retorna com garantia uma pd.Series 1D mesmo se houver colunas duplicadas
+    com o mesmo nome ou se a coluna não existir no DataFrame.
+    """
+    if df is None or df.empty or col_name not in df.columns:
+        idx = df.index if df is not None and not df.empty else [0]
+        return pd.Series([default_val] * len(idx), index=idx)
+    col_obj = df[col_name]
+    if isinstance(col_obj, pd.DataFrame):
+        # Múltiplas colunas com o mesmo nome: pega a primeira coluna
+        col_obj = col_obj.iloc[:, 0]
+    return col_obj
+
+
 def find_sheet_header_and_read(excel_file, sheet_name: str) -> pd.DataFrame:
     """
     Localiza dinamicamente a linha de cabeçalho do Excel e retorna o DataFrame
@@ -165,8 +180,8 @@ def find_sheet_header_and_read(excel_file, sheet_name: str) -> pd.DataFrame:
         header_idx = 0
         best_score = 0
 
-        # Analisa até as 20 primeiras linhas para encontrar a linha do cabeçalho
-        for r_idx in range(min(20, len(df_raw))):
+        # Analisa até as 25 primeiras linhas para encontrar a linha do cabeçalho
+        for r_idx in range(min(25, len(df_raw))):
             row_vals = df_raw.iloc[r_idx].dropna().tolist()
             score = 0
             for val in row_vals:
@@ -188,223 +203,281 @@ def find_sheet_header_and_read(excel_file, sheet_name: str) -> pd.DataFrame:
         df = df.dropna(how="all", axis=1)
         df = df.dropna(how="all", axis=0)
 
-        # Limpar espaços nos nomes das colunas
+        # Limpar espaços nos nomes das colunas e deduplicar
         df.columns = [str(c).strip() for c in df.columns]
+        df = df.loc[:, ~df.columns.duplicated(keep="first")].copy()
 
         return df
     except Exception:
         try:
-            return pd.read_excel(excel_file, sheet_name=sheet_name)
+            df = pd.read_excel(excel_file, sheet_name=sheet_name)
+            df = df.dropna(how="all", axis=1).dropna(how="all", axis=0)
+            df.columns = [str(c).strip() for c in df.columns]
+            df = df.loc[:, ~df.columns.duplicated(keep="first")].copy()
+            return df
         except:
             return pd.DataFrame()
 
 
 def normalize_base_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Garante mapeamento robusto de colunas e dados numéricos/textuais da BASE."""
+    """
+    Garante mapeamento 1-para-1 de colunas e dados numéricos/textuais da BASE,
+    construindo um novo DataFrame estritamente estruturado e sem duplicidades.
+    """
     if df is None or df.empty:
-        df = pd.DataFrame()
+        return pd.DataFrame(columns=[
+            "STATUS", "MÊS", "DATA", "LANÇAMENTO", "RAZÃO SOCIAL",
+            "CPF/CNPJ", "VALOR (R$)", "CÓD GRUPO", "GRUPO",
+            "CÓD. NATUREZA", "DESCRIÇÃO NATUREZA", "TIPO"
+        ])
 
-    col_mapping = {}
-    for col in df.columns:
-        norm = clean_col_name(col)
-        if norm in ["MES", "COMPETENCIA", "PERIODO", "MES ANO", "MES/ANO"] or "MES" in norm:
-            col_mapping[col] = "MÊS"
-        elif norm in ["STATUS", "SITUACAO", "ESTADO"] or "STATUS" in norm or "SITUACAO" in norm:
-            col_mapping[col] = "STATUS"
-        elif norm in ["DATA", "VENCIMENTO", "PAGAMENTO", "DATA PAGAMENTO", "DT PAGTO"] or "DATA" in norm or "VENCIMENTO" in norm:
-            col_mapping[col] = "DATA"
-        elif norm in ["LANCAMENTO", "HISTORICO", "DESCRICAO", "DESCRICAO LANCAMENTO"] or "LANCAMENTO" in norm or "HISTORICO" in norm:
-            col_mapping[col] = "LANÇAMENTO"
-        elif norm in ["RAZAO SOCIAL", "FORNECEDOR", "CREDOR", "BENEFICIARIO", "CLIENTE", "FAVORECIDO"] or "RAZAO" in norm or "FORNECEDOR" in norm or "CREDOR" in norm:
-            col_mapping[col] = "RAZÃO SOCIAL"
-        elif norm in ["CPF/CNPJ", "CNPJ", "CPF", "DOC", "DOCUMENTO"] or "CNPJ" in norm or "CPF" in norm:
-            col_mapping[col] = "CPF/CNPJ"
-        elif "VALOR" in norm or "TOTAL" in norm or "LIQUIDO" in norm:
-            col_mapping[col] = "VALOR (R$)"
-        elif "COD" in norm and "GRUPO" in norm:
-            col_mapping[col] = "CÓD GRUPO"
-        elif "COD" in norm and "NATUREZA" in norm:
-            col_mapping[col] = "CÓD. NATUREZA"
-        elif "DESC" in norm and "NATUREZA" in norm:
-            col_mapping[col] = "DESCRIÇÃO NATUREZA"
-        elif "NATUREZA" in norm:
-            col_mapping[col] = "DESCRIÇÃO NATUREZA"
-        elif "GRUPO" in norm:
-            col_mapping[col] = "GRUPO"
-        elif "TIPO" in norm:
-            col_mapping[col] = "TIPO"
+    # Remover colunas duplicadas
+    df = df.loc[:, ~df.columns.duplicated(keep="first")].copy()
+    cols_clean = {c: clean_col_name(str(c)) for c in df.columns}
 
-    df = df.rename(columns=col_mapping)
+    def pick_col(exact_list, contains_list=None, exclude=None):
+        exclude = exclude or set()
+        for exact in exact_list:
+            ex_norm = clean_col_name(exact)
+            for orig, norm in cols_clean.items():
+                if norm == ex_norm and orig not in exclude:
+                    return orig
+        if contains_list:
+            for cont in contains_list:
+                cont_norm = clean_col_name(cont)
+                for orig, norm in cols_clean.items():
+                    if cont_norm in norm and orig not in exclude:
+                        return orig
+        return None
 
-    # 1. VALOR (R$)
-    if "VALOR (R$)" not in df.columns:
-        for c in df.columns:
-            if "VALOR" in clean_col_name(c):
-                df["VALOR (R$)"] = df[c]
-                break
-        else:
-            df["VALOR (R$)"] = 0.0
+    used = set()
 
-    df["VALOR (R$)"] = df["VALOR (R$)"].apply(clean_valor)
+    # 1. VALOR
+    col_valor = pick_col(["VALOR (R$)", "VALOR R$", "VALOR LIQUIDO", "VALOR", "TOTAL", "VALOR PAGO"], ["VALOR", "TOTAL", "LIQUIDO"], used)
+    if col_valor: used.add(col_valor)
 
     # 2. STATUS
-    if "STATUS" not in df.columns:
-        df["STATUS"] = "PAGO"
-    else:
-        def clean_status_val(v):
-            s = str(v).strip().upper()
-            if "ABERTO" in s:
-                return "EM ABERTO"
-            if "PAGO" in s or "LIQUIDADO" in s or "BAIXADO" in s:
-                return "PAGO"
-            if "CANCEL" in s:
-                return "CANCELADO"
-            return s if s and s != "NAN" else "PAGO"
-        df["STATUS"] = df["STATUS"].apply(clean_status_val)
+    col_status = pick_col(["STATUS", "SITUACAO", "ESTADO", "SITUAÇÃO"], ["STATUS", "SITUAC"], used)
+    if col_status: used.add(col_status)
 
     # 3. DATA
-    if "DATA" not in df.columns:
-        df["DATA"] = "2026-01-01"
-    else:
-        df["DATA"] = df["DATA"].astype(str).str.strip()
+    col_data = pick_col(["DATA", "DATA PAGAMENTO", "VENCIMENTO", "DT PAGTO", "DATA VENCIMENTO", "PAGAMENTO"], ["DATA", "VENCIMENTO", "PAGTO"], used)
+    if col_data: used.add(col_data)
 
     # 4. MÊS
-    if "MÊS" not in df.columns:
-        if "DATA" in df.columns:
-            df["MÊS"] = df["DATA"].apply(lambda d: format_mes_val(None, d))
-        else:
-            df["MÊS"] = "GERAL"
-    else:
-        df["MÊS"] = [
-            format_mes_val(m, d)
-            for m, d in zip(df["MÊS"], df.get("DATA", [None] * len(df)))
-        ]
+    col_mes = pick_col(["MES", "MÊS", "COMPETENCIA", "PERIODO", "COMPETÊNCIA", "MES ANO", "MES/ANO"], ["MES"], used)
+    if col_mes: used.add(col_mes)
 
-    # 5. GRUPO
-    if "GRUPO" not in df.columns:
-        df["GRUPO"] = "OUTROS"
-    else:
-        df["GRUPO"] = df["GRUPO"].fillna("OUTROS").astype(str).str.strip().str.upper()
+    # 5. CÓD GRUPO (antes de GRUPO)
+    col_cod_grupo = pick_col(["COD GRUPO", "CÓD GRUPO", "COD. GRUPO", "CODIGO GRUPO"], ["COD GRUPO", "COD. GRUPO"], used)
+    if col_cod_grupo: used.add(col_cod_grupo)
 
-    # 6. RAZÃO SOCIAL
-    if "RAZÃO SOCIAL" not in df.columns:
-        df["RAZÃO SOCIAL"] = "NÃO IDENTIFICADO"
-    else:
-        df["RAZÃO SOCIAL"] = df["RAZÃO SOCIAL"].fillna("NÃO IDENTIFICADO").astype(str).str.strip()
-        df["RAZÃO SOCIAL"] = df["RAZÃO SOCIAL"].replace({"": "NÃO IDENTIFICADO", "nan": "NÃO IDENTIFICADO", "NAN": "NÃO IDENTIFICADO", "-": "NÃO IDENTIFICADO"})
+    # 6. GRUPO
+    col_grupo = pick_col(["GRUPO", "CENTRO DE CUSTO", "CATEGORIA", "CLASSIFICACAO", "GRUPO DESPESA"], ["GRUPO", "CENTRO"], used)
+    if col_grupo: used.add(col_grupo)
 
-    # 7. LANÇAMENTO
-    if "LANÇAMENTO" not in df.columns:
-        df["LANÇAMENTO"] = "Sem histórico"
-    else:
-        df["LANÇAMENTO"] = df["LANÇAMENTO"].fillna("Sem histórico").astype(str).str.strip()
+    # 7. CÓD NATUREZA (antes de DESCRIÇÃO NATUREZA)
+    col_cod_nat = pick_col(["COD NATUREZA", "CÓD. NATUREZA", "COD. NATUREZA", "CODIGO NATUREZA"], ["COD NATUREZA", "COD. NAT"], used)
+    if col_cod_nat: used.add(col_cod_nat)
 
-    # 8. CPF/CNPJ
-    if "CPF/CNPJ" not in df.columns:
-        df["CPF/CNPJ"] = ""
-    else:
-        df["CPF/CNPJ"] = df["CPF/CNPJ"].fillna("").astype(str).str.strip()
+    # 8. DESCRIÇÃO NATUREZA
+    col_desc_nat = pick_col(["DESCRICAO NATUREZA", "DESCRIÇÃO NATUREZA", "NATUREZA", "CONTA CONTABIL"], ["NATUREZA", "CONTA"], used)
+    if col_desc_nat: used_cols_set = used.add(col_desc_nat)
 
-    # 9. DESCRIÇÃO NATUREZA
-    if "DESCRIÇÃO NATUREZA" not in df.columns:
-        df["DESCRIÇÃO NATUREZA"] = ""
-    else:
-        df["DESCRIÇÃO NATUREZA"] = df["DESCRIÇÃO NATUREZA"].fillna("").astype(str).str.strip()
+    # 9. RAZÃO SOCIAL
+    col_razao = pick_col(["RAZAO SOCIAL", "RAZÃO SOCIAL", "FORNECEDOR", "CREDOR", "BENEFICIARIO", "CLIENTE", "FAVORECIDO"], ["RAZAO", "FORNECEDOR", "CREDOR", "FAVORECIDO"], used)
+    if col_razao: used.add(col_razao)
 
-    # 10. TIPO
-    if "TIPO" not in df.columns:
-        df["TIPO"] = "VARIÁVEL"
-    else:
-        df["TIPO"] = df["TIPO"].fillna("VARIÁVEL").astype(str).str.strip().str.upper()
+    # 10. LANÇAMENTO
+    col_lanc = pick_col(["LANCAMENTO", "LANÇAMENTO", "HISTORICO", "HISTÓRICO", "DESCRICAO", "DESCRICAO LANCAMENTO"], ["LANCAMENTO", "HISTOR"], used)
+    if col_lanc: used.add(col_lanc)
 
-    return df
+    # 11. CPF/CNPJ
+    col_cpf = pick_col(["CPF/CNPJ", "CNPJ", "CPF", "DOC", "DOCUMENTO"], ["CNPJ", "CPF", "DOCUMENTO"], used)
+    if col_cpf: used.add(col_cpf)
+
+    # 12. TIPO
+    col_tipo = pick_col(["TIPO", "TIPO DESPESA", "TIPO CUSTO"], ["TIPO"], used)
+    if col_tipo: used.add(col_tipo)
+
+    # Construção de novo DataFrame estritamente estruturado
+    out = pd.DataFrame(index=df.index)
+
+    # Valor
+    s_val = safe_series(df, col_valor, 0.0) if col_valor else pd.Series(0.0, index=df.index)
+    out["VALOR (R$)"] = s_val.apply(clean_valor)
+
+    # Status
+    def clean_status_val(v):
+        s = str(v).strip().upper()
+        if "ABERTO" in s:
+            return "EM ABERTO"
+        if "PAGO" in s or "LIQUIDADO" in s or "BAIXADO" in s:
+            return "PAGO"
+        if "CANCEL" in s:
+            return "CANCELADO"
+        return s if s and s != "NAN" else "PAGO"
+    s_status = safe_series(df, col_status, "PAGO") if col_status else pd.Series("PAGO", index=df.index)
+    out["STATUS"] = s_status.apply(clean_status_val)
+
+    # Data
+    s_data = safe_series(df, col_data, "2026-01-01") if col_data else pd.Series("2026-01-01", index=df.index)
+    out["DATA"] = s_data.astype(str).str.strip()
+
+    # Mês
+    if col_mes:
+        s_mes = safe_series(df, col_mes, "")
+        out["MÊS"] = [format_mes_val(m, d) for m, d in zip(s_mes, out["DATA"])]
+    else:
+        out["MÊS"] = [format_mes_val(None, d) for d in out["DATA"]]
+
+    # Lançamento
+    s_lanc = safe_series(df, col_lanc, "Sem histórico") if col_lanc else pd.Series("Sem histórico", index=df.index)
+    out["LANÇAMENTO"] = s_lanc.fillna("Sem histórico").astype(str).str.strip()
+
+    # Razão Social
+    s_razao = safe_series(df, col_razao, "NÃO IDENTIFICADO") if col_razao else pd.Series("NÃO IDENTIFICADO", index=df.index)
+    razao_clean = s_razao.fillna("NÃO IDENTIFICADO").astype(str).str.strip()
+    out["RAZÃO SOCIAL"] = razao_clean.replace({"": "NÃO IDENTIFICADO", "nan": "NÃO IDENTIFICADO", "NAN": "NÃO IDENTIFICADO", "-": "NÃO IDENTIFICADO", "None": "NÃO IDENTIFICADO"})
+
+    # CPF/CNPJ
+    s_cpf = safe_series(df, col_cpf, "") if col_cpf else pd.Series("", index=df.index)
+    out["CPF/CNPJ"] = s_cpf.fillna("").astype(str).str.strip()
+
+    # Cód Grupo
+    s_cg = safe_series(df, col_cod_grupo, "") if col_cod_grupo else pd.Series("", index=df.index)
+    out["CÓD GRUPO"] = s_cg.fillna("").astype(str).str.strip()
+
+    # Grupo
+    s_grupo = safe_series(df, col_grupo, "OUTROS") if col_grupo else pd.Series("OUTROS", index=df.index)
+    out["GRUPO"] = s_grupo.fillna("OUTROS").astype(str).str.strip().str.upper()
+
+    # Cód Natureza
+    s_cn = safe_series(df, col_cod_nat, "") if col_cod_nat else pd.Series("", index=df.index)
+    out["CÓD. NATUREZA"] = s_cn.fillna("").astype(str).str.strip()
+
+    # Descrição Natureza
+    s_dn = safe_series(df, col_desc_nat, "") if col_desc_nat else pd.Series("", index=df.index)
+    out["DESCRIÇÃO NATUREZA"] = s_dn.fillna("").astype(str).str.strip()
+
+    # Tipo
+    s_tipo = safe_series(df, col_tipo, "VARIÁVEL") if col_tipo else pd.Series("VARIÁVEL", index=df.index)
+    out["TIPO"] = s_tipo.fillna("VARIÁVEL").astype(str).str.strip().str.upper()
+
+    return out
 
 
 def normalize_board_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Normaliza o dataframe da aba DESPESA FIXA BOARD."""
+    """Normaliza o dataframe da aba DESPESA FIXA BOARD sem risco de duplicidade."""
     if df is None or df.empty:
         return pd.DataFrame(columns=["Categoria", "Descrição", "Meta Mensal (R$)", "Realizado Médio (R$)", "Observação"])
 
-    col_map = {}
-    for col in df.columns:
-        norm = clean_col_name(col)
-        if "CATEGORIA" in norm or "GRUPO" in norm:
-            col_map[col] = "Categoria"
-        elif "DESCRICAO" in norm or "DETALHE" in norm or "ITEM" in norm:
-            col_map[col] = "Descrição"
-        elif "META" in norm or "ORCADO" in norm or "PREVISTO" in norm:
-            col_map[col] = "Meta Mensal (R$)"
-        elif "REALIZADO" in norm or "MEDIO" in norm or "ATUAL" in norm or "GASTO" in norm:
-            col_map[col] = "Realizado Médio (R$)"
-        elif "OBSERVACAO" in norm or "NOTA" in norm:
-            col_map[col] = "Observação"
+    df = df.loc[:, ~df.columns.duplicated(keep="first")].copy()
+    cols_clean = {c: clean_col_name(str(c)) for c in df.columns}
 
-    df = df.rename(columns=col_map)
-    for col in ["Categoria", "Descrição", "Observação"]:
-        if col not in df.columns:
-            df[col] = ""
-        else:
-            df[col] = df[col].fillna("").astype(str).str.strip()
+    def pick_col(exact_list, contains_list=None):
+        for exact in exact_list:
+            ex_norm = clean_col_name(exact)
+            for orig, norm in cols_clean.items():
+                if norm == ex_norm:
+                    return orig
+        if contains_list:
+            for cont in contains_list:
+                cont_norm = clean_col_name(cont)
+                for orig, norm in cols_clean.items():
+                    if cont_norm in norm:
+                        return orig
+        return None
 
-    for col in ["Meta Mensal (R$)", "Realizado Médio (R$)"]:
-        if col not in df.columns:
-            df[col] = 0.0
-        else:
-            df[col] = df[col].apply(clean_valor)
+    c_cat = pick_col(["CATEGORIA", "GRUPO"], ["CATEGORIA", "GRUPO"])
+    c_desc = pick_col(["DESCRICAO", "DESCRIÇÃO", "ITEM", "DETALHE"], ["DESCRICAO", "ITEM"])
+    c_meta = pick_col(["META MENSAL (R$)", "META", "ORCADO", "ORÇADO", "PREVISTO"], ["META", "ORCADO", "PREVISTO"])
+    c_real = pick_col(["REALIZADO MEDIO (R$)", "REALIZADO", "MEDIO", "ATUAL", "GASTO"], ["REALIZADO", "MEDIO", "GASTO"])
+    c_obs = pick_col(["OBSERVACAO", "OBSERVAÇÃO", "NOTA", "STATUS"], ["OBSERVACAO", "NOTA"])
 
-    return df
+    out = pd.DataFrame(index=df.index)
+    s_cat = safe_series(df, c_cat, "") if c_cat else pd.Series("", index=df.index)
+    out["Categoria"] = s_cat.fillna("").astype(str).str.strip()
+
+    s_desc = safe_series(df, c_desc, "") if c_desc else pd.Series("", index=df.index)
+    out["Descrição"] = s_desc.fillna("").astype(str).str.strip()
+
+    s_meta = safe_series(df, c_meta, 0.0) if c_meta else pd.Series(0.0, index=df.index)
+    out["Meta Mensal (R$)"] = s_meta.apply(clean_valor)
+
+    s_real = safe_series(df, c_real, 0.0) if c_real else pd.Series(0.0, index=df.index)
+    out["Realizado Médio (R$)"] = s_real.apply(clean_valor)
+
+    s_obs = safe_series(df, c_obs, "") if c_obs else pd.Series("", index=df.index)
+    out["Observação"] = s_obs.fillna("").astype(str).str.strip()
+
+    return out
 
 
 def normalize_bancos_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Normaliza o dataframe da aba BANCOS."""
+    """Normaliza o dataframe da aba BANCOS com garantia de tipos e sem duplicidades."""
     if df is None or df.empty:
         return pd.DataFrame(columns=[
             "Banco", "Tipo de Operação", "Contrato", "Saldo Devedor (R$)",
             "Valor Parcela (R$)", "Parcelas Restantes", "Dia Vencimento", "Taxa de Juros", "Status"
         ])
 
-    col_map = {}
-    for col in df.columns:
-        norm = clean_col_name(col)
-        if "BANCO" in norm or "INSTITUICAO" in norm or "CREDOR" in norm:
-            col_map[col] = "Banco"
-        elif "OPERACAO" in norm or "MODALIDADE" in norm:
-            col_map[col] = "Tipo de Operação"
-        elif "CONTRATO" in norm or "NUMERO" in norm:
-            col_map[col] = "Contrato"
-        elif "SALDO" in norm or "DEVEDOR" in norm:
-            col_map[col] = "Saldo Devedor (R$)"
-        elif "PARCELA" in norm and ("VALOR" in norm or "R$" in norm or "MENSAL" in norm):
-            col_map[col] = "Valor Parcela (R$)"
-        elif "RESTANTE" in norm or "QTD" in norm or "PRAZO" in norm:
-            col_map[col] = "Parcelas Restantes"
-        elif "VENCIMENTO" in norm or "DIA" in norm:
-            col_map[col] = "Dia Vencimento"
-        elif "TAXA" in norm or "JUROS" in norm:
-            col_map[col] = "Taxa de Juros"
-        elif "STATUS" in norm or "SITUACAO" in norm:
-            col_map[col] = "Status"
+    df = df.loc[:, ~df.columns.duplicated(keep="first")].copy()
+    cols_clean = {c: clean_col_name(str(c)) for c in df.columns}
 
-    df = df.rename(columns=col_map)
-    for col in ["Banco", "Tipo de Operação", "Contrato", "Taxa de Juros", "Status"]:
-        if col not in df.columns:
-            df[col] = ""
-        else:
-            df[col] = df[col].fillna("").astype(str).str.strip()
+    def pick_col(exact_list, contains_list=None):
+        for exact in exact_list:
+            ex_norm = clean_col_name(exact)
+            for orig, norm in cols_clean.items():
+                if norm == ex_norm:
+                    return orig
+        if contains_list:
+            for cont in contains_list:
+                cont_norm = clean_col_name(cont)
+                for orig, norm in cols_clean.items():
+                    if cont_norm in norm:
+                        return orig
+        return None
 
-    for col in ["Saldo Devedor (R$)", "Valor Parcela (R$)"]:
-        if col not in df.columns:
-            df[col] = 0.0
-        else:
-            df[col] = df[col].apply(clean_valor)
+    c_banco = pick_col(["BANCO", "INSTITUICAO", "CREDOR"], ["BANCO", "INSTITU"])
+    c_op = pick_col(["TIPO DE OPERACAO", "OPERACAO", "MODALIDADE", "TIPO"], ["OPERACAO", "MODALIDADE"])
+    c_ctr = pick_col(["CONTRATO", "NUMERO CONTRATO", "NUMERO"], ["CONTRATO", "NUM"])
+    c_saldo = pick_col(["SALDO DEVEDOR (R$)", "SALDO DEVEDOR", "SALDO"], ["SALDO", "DEVEDOR"])
+    c_parc = pick_col(["VALOR PARCELA (R$)", "VALOR PARCELA", "PARCELA"], ["PARCELA", "MENSAL"])
+    c_rest = pick_col(["PARCELAS RESTANTES", "QTD PARCELAS", "PRAZO"], ["RESTANTE", "QTD", "PRAZO"])
+    c_venc = pick_col(["DIA VENCIMENTO", "VENCIMENTO", "DIA"], ["VENCIMENTO", "DIA"])
+    c_taxa = pick_col(["TAXA DE JUROS", "TAXA", "JUROS"], ["TAXA", "JUROS"])
+    c_status = pick_col(["STATUS", "SITUACAO"], ["STATUS", "SITUAC"])
 
-    for col in ["Parcelas Restantes", "Dia Vencimento"]:
-        if col not in df.columns:
-            df[col] = 0
-        else:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+    out = pd.DataFrame(index=df.index)
+    s_banco = safe_series(df, c_banco, "") if c_banco else pd.Series("", index=df.index)
+    out["Banco"] = s_banco.fillna("").astype(str).str.strip()
 
-    return df
+    s_op = safe_series(df, c_op, "EMPRÉSTIMO") if c_op else pd.Series("EMPRÉSTIMO", index=df.index)
+    out["Tipo de Operação"] = s_op.fillna("EMPRÉSTIMO").astype(str).str.strip()
+
+    s_ctr = safe_series(df, c_ctr, "") if c_ctr else pd.Series("", index=df.index)
+    out["Contrato"] = s_ctr.fillna("").astype(str).str.strip()
+
+    s_saldo = safe_series(df, c_saldo, 0.0) if c_saldo else pd.Series(0.0, index=df.index)
+    out["Saldo Devedor (R$)"] = s_saldo.apply(clean_valor)
+
+    s_parc = safe_series(df, c_parc, 0.0) if c_parc else pd.Series(0.0, index=df.index)
+    out["Valor Parcela (R$)"] = s_parc.apply(clean_valor)
+
+    s_rest = safe_series(df, c_rest, 0) if c_rest else pd.Series(0, index=df.index)
+    out["Parcelas Restantes"] = pd.to_numeric(s_rest, errors="coerce").fillna(0).astype(int)
+
+    s_venc = safe_series(df, c_venc, 10) if c_venc else pd.Series(10, index=df.index)
+    out["Dia Vencimento"] = pd.to_numeric(s_venc, errors="coerce").fillna(10).astype(int)
+
+    s_taxa = safe_series(df, c_taxa, "") if c_taxa else pd.Series("", index=df.index)
+    out["Taxa de Juros"] = s_taxa.fillna("").astype(str).str.strip()
+
+    s_stat = safe_series(df, c_status, "EM ABERTO") if c_status else pd.Series("EM ABERTO", index=df.index)
+    out["Status"] = s_stat.fillna("EM ABERTO").astype(str).str.strip()
+
+    return out
 
 
 # --------------------------------------------------------------------------------------
@@ -478,6 +551,21 @@ def get_mock_datasets():
 # --------------------------------------------------------------------------------------
 def load_excel_file(uploaded_file):
     try:
+        file_name = getattr(uploaded_file, "name", "").lower()
+
+        # Suporte a arquivos CSV diretos
+        if file_name.endswith(".csv"):
+            try:
+                df_raw = pd.read_csv(uploaded_file, sep=None, engine="python")
+            except Exception:
+                uploaded_file.seek(0)
+                df_raw = pd.read_csv(uploaded_file, sep=";")
+            
+            df_base = normalize_base_dataframe(df_raw)
+            df_board = normalize_board_dataframe(pd.DataFrame())
+            df_bancos = normalize_bancos_dataframe(pd.DataFrame())
+            return df_base, df_board, df_bancos, True, None
+
         excel_file = pd.ExcelFile(uploaded_file)
         
         # 1. BASE
